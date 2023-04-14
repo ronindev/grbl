@@ -36,6 +36,7 @@ typedef struct {
                                      // i.e. arcs, canned cycles, and backlash compensation.
   float previous_unit_vec[N_AXIS];   // Unit vector of previous path line segment
   float previous_nominal_speed;  // Nominal speed of previous path line segment
+  uint8_t previous_direction_bits;
 } planner_t;
 static planner_t pl;
 
@@ -329,17 +330,20 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
   int32_t target_steps[N_AXIS], position_steps[N_AXIS];
   float unit_vec[N_AXIS], delta_mm;
   uint8_t idx;
+  uint8_t do_backlash = 0;
 
   // Copy position data based on type of motion being planned.
-  if (block->condition & PL_COND_FLAG_SYSTEM_MOTION) { 
+  if (block->condition & PL_COND_FLAG_SYSTEM_MOTION) {
     #ifdef COREXY
       position_steps[X_AXIS] = system_convert_corexy_to_x_axis_steps(sys_position);
       position_steps[Y_AXIS] = system_convert_corexy_to_y_axis_steps(sys_position);
       position_steps[Z_AXIS] = sys_position[Z_AXIS];
     #else
-      memcpy(position_steps, sys_position, sizeof(sys_position)); 
+      memcpy(position_steps, sys_position, sizeof(sys_position));
     #endif
-  } else { memcpy(position_steps, pl.position, sizeof(pl.position)); }
+  } else {
+    memcpy(position_steps, pl.position, sizeof(pl.position));
+  }
 
   #ifdef COREXY
     target_steps[A_MOTOR] = lround(target[A_MOTOR]*settings.steps_per_mm[A_MOTOR]);
@@ -353,29 +357,51 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
     // Also, compute individual axes distance for move and prep unit vector calculations.
     // NOTE: Computes true distance from converted step values.
     #ifdef COREXY
-      if ( !(idx == A_MOTOR) && !(idx == B_MOTOR) ) {
-        target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
-        block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-      }
-      block->step_event_count = max(block->step_event_count, block->steps[idx]);
       if (idx == A_MOTOR) {
         delta_mm = (target_steps[X_AXIS]-position_steps[X_AXIS] + target_steps[Y_AXIS]-position_steps[Y_AXIS])/settings.steps_per_mm[idx];
       } else if (idx == B_MOTOR) {
         delta_mm = (target_steps[X_AXIS]-position_steps[X_AXIS] - target_steps[Y_AXIS]+position_steps[Y_AXIS])/settings.steps_per_mm[idx];
       } else {
+        target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
+        block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
         delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
       }
     #else
       target_steps[idx] = lround(target[idx]*settings.steps_per_mm[idx]);
       block->steps[idx] = labs(target_steps[idx]-position_steps[idx]);
-      block->step_event_count = max(block->step_event_count, block->steps[idx]);
       delta_mm = (target_steps[idx] - position_steps[idx])/settings.steps_per_mm[idx];
-	  #endif
-    unit_vec[idx] = delta_mm; // Store unit vector numerator
-
+    #endif
     // Set direction bits. Bit enabled always means direction is negative.
-    if (delta_mm < 0.0 ) { block->direction_bits |= get_direction_pin_mask(idx); }
+    if (delta_mm < 0.0) {
+      block->direction_bits |= get_direction_pin_mask(idx);
+    }
+
+    if (!(block->condition & PL_COND_FLAG_SYSTEM_MOTION) //Todo: wired issue with system motion. Need to go deep
+        && settings.backlash[idx] > 0
+        && delta_mm != 0
+        && ((block->direction_bits ^ pl.previous_direction_bits) & get_direction_pin_mask(idx))) {
+      if (!do_backlash) {
+        memset(unit_vec, 0, sizeof(unit_vec));
+        memset(block->steps, 0, sizeof(block->steps));
+
+        block->step_event_count = 0;
+        block->condition = block->condition |= PL_COND_FLAG_RAPID_MOTION;
+        block->backlash_motion = 1;
+      }
+      do_backlash |= get_direction_pin_mask(idx);
+      delta_mm = block->direction_bits & get_direction_pin_mask(idx)
+          ? -settings.backlash[idx]
+          : settings.backlash[idx];
+      block->steps[idx] = lround(fabs(delta_mm * settings.steps_per_mm[idx]));
+    } else if (do_backlash) {
+      block->steps[idx] = delta_mm = 0;
+    }
+
+    block->step_event_count = max(block->step_event_count, block->steps[idx]);
+    unit_vec[idx] = delta_mm; // Store unit vector numerator
   }
+
+  pl.previous_direction_bits ^= do_backlash;
 
   // Bail if this is a zero-length block. Highly unlikely to occur.
   if (block->step_event_count == 0) { return(PLAN_EMPTY_BLOCK); }
@@ -389,10 +415,13 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
   block->rapid_rate = limit_value_by_axis_maximum(settings.max_rate, unit_vec);
 
   // Store programmed rate.
-  if (block->condition & PL_COND_FLAG_RAPID_MOTION) { block->programmed_rate = block->rapid_rate; }
-  else { 
+  if (block->condition & PL_COND_FLAG_RAPID_MOTION) {
+    block->programmed_rate = block->rapid_rate;
+  } else {
     block->programmed_rate = pl_data->feed_rate;
-    if (block->condition & PL_COND_FLAG_INVERSE_TIME) { block->programmed_rate *= block->millimeters; }
+    if (block->condition & PL_COND_FLAG_INVERSE_TIME) {
+      block->programmed_rate *= block->millimeters;
+    }
   }
 
   // TODO: Need to check this method handling zero junction speeds when starting from rest.
@@ -456,10 +485,10 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
     float nominal_speed = plan_compute_profile_nominal_speed(block);
     plan_compute_profile_parameters(block, nominal_speed, pl.previous_nominal_speed);
     pl.previous_nominal_speed = nominal_speed;
-    
+
     // Update previous path unit_vector and planner position.
     memcpy(pl.previous_unit_vec, unit_vec, sizeof(unit_vec)); // pl.previous_unit_vec[] = unit_vec[]
-    memcpy(pl.position, target_steps, sizeof(target_steps)); // pl.position[] = target_steps[]
+    if (!do_backlash) memcpy(pl.position, target_steps, sizeof(target_steps)); // pl.position[] = target_steps[]
 
     // New block is all set. Update buffer head and next buffer head indices.
     block_buffer_head = next_buffer_head;
@@ -468,6 +497,7 @@ uint8_t plan_buffer_line(float *target, plan_line_data_t *pl_data)
     // Finish up by recalculating the plan with the new block.
     planner_recalculate();
   }
+  if (do_backlash) return (PLAN_BACKLASH_SEND_AGAIN);
   return(PLAN_OK);
 }
 
