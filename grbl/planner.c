@@ -199,7 +199,10 @@ static void planner_recalculate()
 
 void plan_reset()
 {
+  uint8_t tmp_prev_dir_bits; //Store previous directions, cause backlash
+  tmp_prev_dir_bits = pl.previous_direction_bits;
   memset(&pl, 0, sizeof(planner_t)); // Clear planner struct
+  pl.previous_direction_bits = tmp_prev_dir_bits;
   plan_reset_buffer();
 }
 
